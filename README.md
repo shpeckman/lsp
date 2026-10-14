@@ -129,6 +129,16 @@ Every request returns its id, for `client.cancel`, and calls its block when the 
 | `format`                  | `Bool`                           | Applies the server's edits as one undo step, using the document's indent for the tab size                                |
 | `rename(name)`            | `LSP::Rename`                    | Applies the edits for this document; `remote` holds the edits for other files, by URI                                    |
 | `definition`              | `Array(LSP::Location)`           | URIs with `span`s in the server's units, for the host to open                                                            |
+| `inlay_hints(from, to)`   | `Array(LSP::InlayHint)`          | Also replaces the document's `"lsp"` annotations, so the hints move with later edits                                     |
+| `folding_ranges`          | `Array(LSP::FoldRange)`          | Line ranges the server would fold                                                                                        |
+| `fold(view)`              | `Array(LSP::FoldRange)`          | The same, applied to that view's folds                                                                                   |
+| `semantic_tokens`         | `LSP::Semantic`                  | A `Scribe::TokenSource` over the server's tokens, decoded into cluster columns                                           |
+| `references(declaration = true)` | `Array(LSP::Location)`    | Every use of the symbol at the caret                                                                                     |
+| `symbols`                 | `Array(LSP::Symbol)`             | The document's symbols, nested; `each` walks them with a depth                                                           |
+| `code_actions(from, to, kinds)` | `Array(LSP::CodeAction)`   | Quick fixes and refactors for a range, the selection by default                                                          |
+| `resolve(action)`         | `LSP::CodeAction`                | Fills in an action the server sent without its edit                                                                      |
+| `run(action)`             | `LSP::Applied`                   | Applies an action's edits, or runs its command                                                                           |
+| `rename_everywhere(name)` | `LSP::Rename`, `LSP::Applied`    | A rename applied here and in every other file it touches                                                                 |
 
 A snippet item carries both: `text` is the snippet flattened to plain text, for a completion list, and `snippet` is the source, which `accept` inserts through `Scribe::View#insert_snippet` so the first placeholder comes back selected. `snippet(item)` hands back the `Scribe::Snippet` so a host can drive `next_stop` and `previous_stop` from Tab and Shift+Tab. Both take an optional view, for a document shown in more than one pane.
 
@@ -137,11 +147,78 @@ synced.complete { |items| items.first?.try { |item| @stops = synced.snippet(item
 @stops.try(&.next_stop(editor.view))
 ```
 
+### Inlay hints
+
+`inlay_hints` asks for the hints in a cluster range and turns them into `Scribe::Annotation`s under the `"lsp"` source, so they follow later edits and are dropped when the document closes. A hint's `label` already carries the server's padding, its `kind` is `"type"`, `"parameter"` or `"hint"`, and its `tooltip` is the markup. `annotate(hints)` applies a set you fetched some other way.
+
+```crystal
+synced.inlay_hints { |hints| ctx.toast("#{hints.size} hints") }
+document.annotations_on(3)        # what to draw beside line 3
+```
+
+### Folding
+
+```crystal
+synced.fold(editor.view) { |ranges| ctx.toast("#{ranges.size} folds") }
+```
+
+`fold` replaces that view's folds with the server's ranges; `folding_ranges` hands them over without applying them. A range of one line is dropped, since there is nothing to collapse.
+
+### Semantic tokens
+
+`semantic_tokens` decodes the server's relative token array into a `Semantic`, which includes `Scribe::TokenSource` and so can be handed straight to a host's editor. The legend comes from the server's capability, or falls back to the standard one the client advertised.
+
+```crystal
+synced.semantic_tokens { |tokens| editor.token_source = tokens }
+```
+
+A token's `kind` is its type name with each modifier appended as a dotted segment — `function.declaration`, `variable.readonly` — which is exactly what a renderer that styles through every prefix of a dotted name wants. The tokens are a snapshot: `stale?(buffer)` compares the buffer's revision against the one they were decoded at, so a host re-requests after an edit settles. `semantic?` returns the current set without asking again.
+
+### Symbols and references
+
+A `Symbol` has a `name`, a `kind` (the protocol's numeric kind as a word — `class`, `method`, `variable`, …), a `detail`, its `uri`, its full `span` and the narrower `selection` the name itself occupies, a `container` and its `children`. Both response shapes are read: the nested `DocumentSymbol` and the flat `SymbolInformation`.
+
+```crystal
+synced.symbols do |found|
+  found.each { |symbol| symbol.each { |entry, depth| puts "#{"  " * depth}#{entry.kind} #{entry.name}" } }
+end
+```
+
+### Code actions
+
+```crystal
+synced.code_actions do |actions|
+  action = actions.reject(&.disabled).find(&.preferred) || next
+  if action.edits?
+    synced.run(action) { |applied| report(applied) }
+  else
+    synced.resolve(action) { |filled| synced.run(filled) { |applied| report(applied) } }
+  end
+end
+```
+
+An action carries its `title`, `kind`, `preferred` flag and a `disabled` reason when the server sent one. Servers often omit the edit until asked, which is what `resolve` is for; `edits?` says whether one is already there. `run` applies the edits when the action has them and sends `workspace/executeCommand` when it only has a command.
+
+### Edits in other files
+
+`rename` applies the edits for this document and hands back the rest in `remote`. `rename_everywhere` goes further and applies those too, and `spread(changes)` does it for any set of edits:
+
+```crystal
+synced.rename_everywhere("fresh_name") do |renamed, applied|
+  puts "#{renamed.applied}, #{applied.open.size} open, #{applied.written.size} written"
+  applied.failed.each { |uri, why| warn "#{uri}: #{why}" }
+end
+```
+
+An `Applied` lists the URIs that went to an open document (`open`), the files rewritten on disk (`written`) and anything that could not be done (`failed`), with `ok?` and `count` for the common checks. A file that is not open is read, edited through a scribe document and written back, so its own line ending survives; `write: false` leaves unopened files alone and reports them as failed instead. `Session.path(uri)` turns a `file://` URI into a path and returns `nil` for any other scheme.
+
 `completion_triggers` and `signature_triggers` list the characters after which the server would like to be asked again. `apply(edits)` applies any `RemoteEdit`s for this document, and `offset(point)` and `offsets(span)` convert the server's positions to cluster offsets.
 
 ## Using it with tui
 
-`tui`'s `Editor` exposes the pieces a language client needs: `document`, `suggest(labels) { |index| }` for a completion popup at the caret, `note(markdown)` for hover and signature text, `on_assist` for its language keys (completion, hover, signature, format, rename, definition), and `on_edit` for typed trigger characters. Diagnostics show as soon as they arrive, because they are decorations on the document.
+`tui`'s `Editor` exposes the pieces a language client needs: `document`, `view`, `suggest(labels) { |index| }` for a completion popup at the caret, `note(markdown)` for hover and signature text, `on_assist` for its language keys (completion, hover, signature, format, rename, definition), and `on_edit` for typed trigger characters. Diagnostics show as soon as they arrive, because they are decorations on the document, and so do annotations placed at `Scribe::Placement::RowEnd`.
+
+`Editor` does not yet shift a row's columns for an inline annotation, so `Before` and `After` hints are available as data (`document.annotations_on(line)`) but are not drawn; row-end hints are.
 
 ```crystal
 def connect(ctx : TUI::Context, editor : TUI::Editor, path : String, language : String) : LSP::Document?

@@ -251,3 +251,263 @@ describe LSP::Document do
     LSP::Session.uri("/tmp/a b/c.cr").should eq("file:///tmp/a%20b/c.cr")
   end
 end
+
+describe "LSP::Document inlay hints" do
+  it "turns hints into annotations that move with the text" do
+    server = started(FakeServer.new(%({"textDocumentSync": 2, "inlayHintProvider": true})))
+    server.on("textDocument/inlayHint") do |_params|
+      json(%([
+        {"position": {"line": 0, "character": 5}, "label": ": Int32", "kind": 1, "paddingLeft": true},
+        {"position": {"line": 1, "character": 3}, "label": [{"value": "name"}, {"value": ":"}], "kind": 2,
+         "tooltip": {"kind": "markdown", "value": "**param**"}}
+      ]))
+    end
+    synced_doc, doc = synced(server, "let x = 1\nf(2)")
+
+    hints = [] of LSP::InlayHint
+    synced_doc.inlay_hints { |found| hints = found; nil }
+    eventually { hints.size == 2 }
+
+    hints.first.label.should eq(" : Int32")
+    hints.first.kind.should eq("type")
+    hints.last.label.should eq("name:")
+    hints.last.kind.should eq("parameter")
+    hints.last.tooltip.should eq("**param**")
+
+    doc.annotations.map(&.kind).should eq(["type", "parameter"])
+    doc.annotations.map(&.offset).should eq([5, 13])
+
+    doc.run(Scribe::Command::DocumentStart)
+    doc.insert("xx")
+    doc.annotations.map(&.offset).should eq([7, 15])
+
+    synced_doc.close
+    doc.annotations.should be_empty
+  end
+
+  it "asks about the range it is given" do
+    server = started(FakeServer.new(%({"textDocumentSync": 2, "inlayHintProvider": true})))
+    server.on("textDocument/inlayHint") { |_params| json("[]") }
+    synced_doc, doc = synced(server, "one\ntwo\nthree")
+
+    done = false
+    synced_doc.inlay_hints(4, 7) { |_found| done = true; nil }
+    eventually { done }
+
+    asked = server.messages("textDocument/inlayHint").first["params"]["range"]
+    asked["start"]["line"].as_i.should eq(1)
+    asked["end"]["line"].as_i.should eq(1)
+    asked["end"]["character"].as_i.should eq(3)
+  end
+end
+
+describe "LSP::Document folding ranges" do
+  it "reads fold ranges and applies them to a view" do
+    server = started(FakeServer.new(%({"textDocumentSync": 2, "foldingRangeProvider": true})))
+    server.on("textDocument/foldingRange") do |_params|
+      json(%([
+        {"startLine": 0, "endLine": 3, "kind": "region"},
+        {"startLine": 1, "endLine": 2},
+        {"startLine": 5, "endLine": 5}
+      ]))
+    end
+    synced_doc, doc = synced(server, "a\nb\nc\nd\ne\nf")
+
+    found = [] of LSP::FoldRange
+    synced_doc.folding_ranges { |ranges| found = ranges; nil }
+    eventually { found.size == 2 }
+    found.first.kind.should eq("region")
+    found.last.first.should eq(1)
+
+    applied = false
+    synced_doc.fold { |_ranges| applied = true; nil }
+    eventually { applied }
+
+    doc.view.folds.size.should eq(2)
+    doc.view.folds.collapsed?(0).should be_true
+    doc.view.folds.hidden?(2).should be_true
+    doc.view.folds.hidden?(3).should be_true
+    doc.view.folds.rows.should eq([0, 4, 5])
+    doc.view.layout.row_count.should eq(3)
+  end
+end
+
+describe "LSP::Document semantic tokens" do
+  it "decodes relative tokens into a scribe token source" do
+    legend = %({"textDocumentSync": 2, "semanticTokensProvider": {"legend":
+      {"tokenTypes": ["keyword", "function", "variable"], "tokenModifiers": ["declaration", "readonly"]},
+      "full": true}})
+    server = started(FakeServer.new(legend))
+    server.on("textDocument/semanticTokens/full") do |_params|
+      json(%({"data": [0, 0, 3, 0, 0, 0, 4, 3, 1, 1, 1, 2, 5, 2, 2]}))
+    end
+    synced_doc, doc = synced(server, "def run\n  value = 1")
+
+    tokens = nil.as(LSP::Semantic?)
+    synced_doc.semantic_tokens { |found| tokens = found; nil }
+    eventually { !tokens.nil? }
+
+    semantic = tokens.not_nil!
+    semantic.types.should eq(["keyword", "function", "variable"])
+    semantic.size.should eq(3)
+
+    source = semantic.as(Scribe::TokenSource)
+    source.tokens(doc.buffer, 0).map { |token| {token.start, token.count, token.kind} }
+      .should eq([{0, 3, "keyword"}, {4, 3, "function.declaration"}])
+    source.tokens(doc.buffer, 1).map(&.kind).should eq(["variable.readonly"])
+    source.tokens(doc.buffer, 9).should be_empty
+
+    semantic.stale?(doc.buffer).should be_false
+    doc.insert("x")
+    semantic.stale?(doc.buffer).should be_true
+
+    synced_doc.close
+    semantic.empty?.should be_true
+  end
+
+  it "falls back to the standard legend when the server gives none" do
+    server = started(FakeServer.new(%({"textDocumentSync": 2, "semanticTokensProvider": {"full": true}})))
+    server.on("textDocument/semanticTokens/full") { |_params| json(%({"data": []})) }
+    synced_doc, _doc = synced(server, "x")
+
+    tokens = nil.as(LSP::Semantic?)
+    synced_doc.semantic_tokens { |found| tokens = found; nil }
+    eventually { !tokens.nil? }
+    tokens.not_nil!.types.should eq(LSP::SEMANTIC_TYPES)
+    tokens.not_nil!.empty?.should be_true
+  end
+end
+
+describe "LSP::Document navigation" do
+  it "reads references with and without the declaration" do
+    server = started(FakeServer.new(%({"textDocumentSync": 2, "referencesProvider": true})))
+    server.on("textDocument/references") do |_params|
+      json(%([
+        {"uri": "file:///a.cr", "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 3}}},
+        {"uri": "file:///b.cr", "range": {"start": {"line": 2, "character": 4}, "end": {"line": 2, "character": 7}}}
+      ]))
+    end
+    synced_doc, _doc = synced(server, "foo\nfoo")
+
+    found = [] of LSP::Location
+    synced_doc.references { |list| found = list; nil }
+    eventually { found.size == 2 }
+    found.map(&.uri).should eq(["file:///a.cr", "file:///b.cr"])
+    found.first.span.start.line.should eq(0)
+
+    asked = server.messages("textDocument/references").first["params"]["context"]["includeDeclaration"]
+    asked.as_bool.should be_true
+
+    done = false
+    synced_doc.references(false) { |_list| done = true; nil }
+    eventually { done }
+    server.messages("textDocument/references").last["params"]["context"]["includeDeclaration"].as_bool.should be_false
+  end
+
+  it "reads nested document symbols and flattens them with depth" do
+    server = started(FakeServer.new(%({"textDocumentSync": 2, "documentSymbolProvider": true})))
+    server.on("textDocument/documentSymbol") do |_params|
+      json(%([{
+        "name": "Thing", "kind": 5, "detail": "a class",
+        "range": {"start": {"line": 0, "character": 0}, "end": {"line": 4, "character": 3}},
+        "selectionRange": {"start": {"line": 0, "character": 6}, "end": {"line": 0, "character": 11}},
+        "children": [{
+          "name": "run", "kind": 6,
+          "range": {"start": {"line": 1, "character": 2}, "end": {"line": 3, "character": 5}},
+          "selectionRange": {"start": {"line": 1, "character": 6}, "end": {"line": 1, "character": 9}}
+        }]
+      }]))
+    end
+    synced_doc, _doc = synced(server, "class Thing\n  def run\n    1\n  end\nend")
+
+    found = [] of LSP::Symbol
+    synced_doc.symbols { |list| found = list; nil }
+    eventually { found.size == 1 }
+
+    top = found.first
+    top.name.should eq("Thing")
+    top.kind.should eq("class")
+    top.detail.should eq("a class")
+    top.children.size.should eq(1)
+    top.children.first.kind.should eq("method")
+    top.children.first.container.should eq("Thing")
+
+    flat = [] of {String, Int32}
+    top.each { |entry, depth| flat << {entry.name, depth} }
+    flat.should eq([{"Thing", 0}, {"run", 1}])
+  end
+
+  it "reads the flat SymbolInformation shape too" do
+    server = started(FakeServer.new(%({"textDocumentSync": 2, "documentSymbolProvider": true})))
+    server.on("textDocument/documentSymbol") do |_params|
+      json(%([{"name": "top", "kind": 12, "containerName": "mod",
+        "location": {"uri": "file:///z.cr", "range": {"start": {"line": 1, "character": 0}, "end": {"line": 1, "character": 3}}}}]))
+    end
+    synced_doc, _doc = synced(server, "def top\nend")
+
+    found = [] of LSP::Symbol
+    synced_doc.symbols { |list| found = list; nil }
+    eventually { found.size == 1 }
+    found.first.kind.should eq("function")
+    found.first.uri.should eq("file:///z.cr")
+    found.first.container.should eq("mod")
+    found.first.children.should be_empty
+  end
+end
+
+describe "LSP::Document code actions" do
+  it "reads actions, resolves one and applies its edit" do
+    server = started(FakeServer.new(%({"textDocumentSync": 2, "codeActionProvider": true})))
+    server.on("textDocument/codeAction") do |_params|
+      json(%([
+        {"title": "Fix it", "kind": "quickfix", "isPreferred": true},
+        {"title": "Nope", "kind": "refactor", "disabled": {"reason": "not here"}}
+      ]))
+    end
+    server.on("codeAction/resolve") do |_params|
+      json(%({"title": "Fix it", "kind": "quickfix", "edit": {"changes": {"file:///work/a.cr":
+        [{"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 3}}, "newText": "bar"}]}}}))
+    end
+    synced_doc, doc = synced(server, "foo")
+
+    actions = [] of LSP::CodeAction
+    synced_doc.code_actions { |found| actions = found; nil }
+    eventually { actions.size == 2 }
+    actions.first.title.should eq("Fix it")
+    actions.first.preferred.should be_true
+    actions.first.edits?.should be_false
+    actions.last.disabled.should eq("not here")
+
+    resolved = nil.as(LSP::CodeAction?)
+    synced_doc.resolve(actions.first) { |found| resolved = found; nil }
+    eventually { !resolved.nil? }
+    resolved.not_nil!.edits?.should be_true
+
+    outcome = nil.as(LSP::Applied?)
+    synced_doc.run(resolved.not_nil!) { |found| outcome = found; nil }
+    eventually { !outcome.nil? }
+    outcome.not_nil!.ok?.should be_true
+    outcome.not_nil!.open.should eq(["file:///work/a.cr"])
+    doc.value.should eq("bar")
+  end
+
+  it "runs a command action through workspace/executeCommand" do
+    server = started(FakeServer.new(%({"textDocumentSync": 2, "codeActionProvider": true})))
+    server.on("textDocument/codeAction") do |_params|
+      json(%([{"title": "Organise", "kind": "source.organizeImports",
+        "command": {"command": "do.it", "arguments": ["x"]}}]))
+    end
+    server.on("workspace/executeCommand") { |_params| json("null") }
+    synced_doc, _doc = synced(server, "foo")
+
+    actions = [] of LSP::CodeAction
+    synced_doc.code_actions { |found| actions = found; nil }
+    eventually { actions.size == 1 }
+    actions.first.command.should eq("do.it")
+
+    outcome = nil.as(LSP::Applied?)
+    synced_doc.run(actions.first) { |found| outcome = found; nil }
+    eventually { !outcome.nil? }
+    server.messages("workspace/executeCommand").first["params"]["command"].as_s.should eq("do.it")
+  end
+end

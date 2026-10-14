@@ -16,6 +16,8 @@ module LSP
     @full     : Bool
     @unlisten : Proc(Nil)
 
+    @semantic : Semantic?
+
     def initialize(@session : Session, @document : Scribe::Document, @uri : String, @language : String)
       @version     = 0
       @diagnostics = [] of Diagnostic
@@ -112,6 +114,8 @@ module LSP
     def close : Nil
       @unlisten.call
       @document.decorate(SOURCE, [] of Scribe::Decoration)
+      @document.annotate(SOURCE, [] of Scribe::Annotation)
+      @semantic.try(&.clear)
       client.notify("textDocument/didClose", {textDocument: {uri: @uri}})
       @session.forget(@uri)
     end
@@ -187,11 +191,128 @@ module LSP
       end
     end
 
+    def rename_everywhere(name : String, *, write : Bool = true, &block : Rename, Applied -> Nil) : Int64
+      rename(name) do |result|
+        block.call(result, spread(result.remote, write: write))
+      end
+    end
+
     def definition(&block : Array(Location) -> Nil) : Int64
       unit = units
       client.request("textDocument/definition", {textDocument: {uri: @uri}, position: position(@document.cursor)}) do |result|
         block.call(result.raw.nil? ? [] of Location : LSP.locations(result, unit))
       end
+    end
+
+    def inlay_hints(from : Int32 = 0, to : Int32 = @document.length, &block : Array(InlayHint) -> Nil) : Int64
+      span = JSON.build do |json|
+        json.object do
+          json.field("textDocument") { json.object { json.field("uri", @uri) } }
+          json.field("range") { range(json, @document.buffer.point(from, units), @document.buffer.point(to, units)) }
+        end
+      end
+
+      client.request("textDocument/inlayHint", JSON.parse(span)) do |result|
+        hints = LSP.inlay_hints(result.raw.nil? ? nil : result)
+        annotate(hints)
+        block.call(hints)
+      end
+    end
+
+    def annotate(hints : Array(InlayHint)) : Nil
+      @document.annotate(SOURCE, hints.map do |hint|
+        Scribe::Annotation.new(offset(hint.point), hint.label, Scribe::Placement::Before, hint.kind)
+      end)
+    end
+
+    def folding_ranges(&block : Array(FoldRange) -> Nil) : Int64
+      client.request("textDocument/foldingRange", {textDocument: {uri: @uri}}) do |result|
+        block.call(LSP.fold_ranges(result.raw.nil? ? nil : result))
+      end
+    end
+
+    def fold(view : Scribe::View = @document.view, &block : Array(FoldRange) -> Nil) : Int64
+      folding_ranges do |found|
+        view.folds.replace(found.map { |entry| {entry.first, entry.last} })
+        block.call(found)
+      end
+    end
+
+    def semantic_tokens(&block : Semantic -> Nil) : Int64
+      found = @semantic ||= Semantic.legend(client.capability("semanticTokensProvider"))
+      client.request("textDocument/semanticTokens/full", {textDocument: {uri: @uri}}) do |result|
+        data = result["data"]?.try(&.as_a?).try(&.compact_map(&.as_i?)) || [] of Int32
+        found.replace(data, @document.buffer, units)
+        block.call(found)
+      end
+    end
+
+    def semantic? : Semantic?
+      @semantic
+    end
+
+    def references(include_declaration : Bool = true, &block : Array(Location) -> Nil) : Int64
+      unit = units
+      client.request("textDocument/references", {textDocument: {uri: @uri},
+        position: position(@document.cursor), context: {includeDeclaration: include_declaration}}) do |result|
+        block.call(result.raw.nil? ? [] of Location : LSP.locations(result, unit))
+      end
+    end
+
+    def symbols(&block : Array(Symbol) -> Nil) : Int64
+      unit = units
+      client.request("textDocument/documentSymbol", {textDocument: {uri: @uri}}) do |result|
+        block.call(LSP.symbols(result.raw.nil? ? nil : result, @uri, unit))
+      end
+    end
+
+    def code_actions(from : Int32 = @document.view.selection.begin, to : Int32 = @document.view.selection.end,
+                     kinds : Array(String)? = nil, &block : Array(CodeAction) -> Nil) : Int64
+      found   = @document.decorations(from, to + 1)
+      request = JSON.build do |json|
+        json.object do
+          json.field("textDocument") { json.object { json.field("uri", @uri) } }
+          json.field("range") { range(json, @document.buffer.point(from, units), @document.buffer.point(to, units)) }
+          json.field("context") do
+            json.object do
+              json.field("diagnostics") { json.array { } }
+              kinds.try { |list| json.field("only") { json.array { list.each { |kind| json.scalar(kind) } } } }
+              json.field("triggerKind", 2)
+            end
+          end
+        end
+      end
+
+      client.request("textDocument/codeAction", JSON.parse(request)) do |result|
+        block.call(LSP.code_actions(result.raw.nil? ? nil : result))
+      end
+    end
+
+    def resolve(action : CodeAction, &block : CodeAction -> Nil) : Int64
+      client.request("codeAction/resolve", action.data) do |result|
+        block.call(LSP.code_actions(JSON.parse("[#{result.to_json}]")).first? || action)
+      end
+    end
+
+    def run(action : CodeAction, *, write : Bool = true, &block : Applied -> Nil) : Nil
+      if action.edits?
+        block.call(spread(action.edits, write: write))
+        return
+      end
+
+      name = action.command
+      unless name
+        block.call(Applied.new([] of String, [] of String, {} of String => String))
+        return
+      end
+
+      client.request("workspace/executeCommand", {command: name, arguments: action.arguments}) do |_result|
+        block.call(Applied.new([@uri], [] of String, {} of String => String))
+      end
+    end
+
+    def spread(changes : Hash(String, Array(RemoteEdit)), *, write : Bool = true) : Applied
+      @session.apply(changes, @document.graphemes, units, write: write)
     end
 
     def apply(edits : Array(RemoteEdit)) : Bool
