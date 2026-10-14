@@ -1,0 +1,18 @@
+# shard.yml
+name: lsp
+version: 0.1.0
+
+authors:
+  - shpeckman
+
+description: |
+  A Language Server Protocol client for Crystal: JSON-RPC over a server process, document synchronisation for
+  scribe documents, diagnostics, completion, hover, signature help, formatting, rename and go-to-definition.
+
+crystal: ">= 1.21.0"
+
+license: MIT
+
+dependencies:
+  scribe:
+    github: shpeckman/scribe
