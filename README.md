@@ -121,13 +121,21 @@ Every request returns its id, for `client.cancel`, and calls its block when the 
 
 | Method                    | Block receives                   | Notes                                                                                                                    |
 |---------------------------|----------------------------------|--------------------------------------------------------------------------------------------------------------------------|
-| `complete(trigger = nil)` | `Array(LSP::Completion)`, sorted | Each item has `label`, `kind`, `detail`, `documentation` and the `text` to insert, with snippets flattened to plain text |
-| `accept(item)`            | —                                | Applies an item: its own range or the word before the caret, plus any extra edits, as one undo step                      |
+| `complete(trigger = nil)` | `Array(LSP::Completion)`, sorted | Each item has `label`, `kind`, `detail`, `documentation`, the `text` to insert, and `snippet` with the original source when the server sent one |
+| `accept(item)`            | —                                | Applies an item: its own range or the word before the caret, plus any extra edits, as one undo step. A snippet item is inserted with its tabstops |
+| `snippet(item)`           | `Scribe::Snippet?`               | Accepts a snippet item and returns the live session, for stepping through its stops                                     |
 | `hover`                   | `String?`                        | Markdown or plain text                                                                                                   |
 | `signature_help`          | `LSP::SignatureHelp?`            | `current` is the active signature; `parameters` are character ranges in its `label`                                      |
 | `format`                  | `Bool`                           | Applies the server's edits as one undo step, using the document's indent for the tab size                                |
 | `rename(name)`            | `LSP::Rename`                    | Applies the edits for this document; `remote` holds the edits for other files, by URI                                    |
 | `definition`              | `Array(LSP::Location)`           | URIs with `span`s in the server's units, for the host to open                                                            |
+
+A snippet item carries both: `text` is the snippet flattened to plain text, for a completion list, and `snippet` is the source, which `accept` inserts through `Scribe::View#insert_snippet` so the first placeholder comes back selected. `snippet(item)` hands back the `Scribe::Snippet` so a host can drive `next_stop` and `previous_stop` from Tab and Shift+Tab. Both take an optional view, for a document shown in more than one pane.
+
+```crystal
+synced.complete { |items| items.first?.try { |item| @stops = synced.snippet(item) } }
+@stops.try(&.next_stop(editor.view))
+```
 
 `completion_triggers` and `signature_triggers` list the characters after which the server would like to be asked again. `apply(edits)` applies any `RemoteEdit`s for this document, and `offset(point)` and `offsets(span)` convert the server's positions to cluster offsets.
 

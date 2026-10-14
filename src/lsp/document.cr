@@ -123,13 +123,40 @@ module LSP
       end
     end
 
-    def accept(item : Completion) : Bool
-      cursor = @document.cursor
+    def accept(item : Completion, view : Scribe::View = @document.view) : Bool
+      accept_snippet(item, view) || accept_text(item, view)
+    end
+
+    def snippet(item : Completion, view : Scribe::View = @document.view) : Scribe::Snippet?
+      source = item.snippet || return nil
+      extra  = item.additional.map { |edit| Scribe::Edit.new(offsets(edit.span), edit.text) }
+      @document.transaction do
+        view.place_carets([Scribe::Caret.new(*span_of(item, view))])
+        found = view.insert_snippet(source)
+        @document.replace_ranges(extra, view: view) unless extra.empty?
+        found
+      end
+    end
+
+    private def accept_snippet(item : Completion, view : Scribe::View) : Bool
+      return false unless item.snippet?
+
+      snippet(item, view)
+      true
+    end
+
+    private def accept_text(item : Completion, view : Scribe::View) : Bool
+      from, to = span_of(item, view)
+      edits    = [Scribe::Edit.new(from...to, item.text)] +
+                 item.additional.map { |edit| Scribe::Edit.new(offsets(edit.span), edit.text) }
+      @document.replace_ranges(edits, view: view)
+    end
+
+    private def span_of(item : Completion, view : Scribe::View) : {Int32, Int32}
+      cursor = view.cursor
       range  = item.span.try { |span| offsets(span) } || (word_start(cursor)...cursor)
       range  = range.begin...cursor if range.begin <= cursor && cursor > range.end
-
-      edits = [Scribe::Edit.new(range, item.text)] + item.additional.map { |edit| Scribe::Edit.new(offsets(edit.span), edit.text) }
-      @document.replace_ranges(edits)
+      {range.begin, range.end}
     end
 
     def hover(&block : String? -> Nil) : Int64

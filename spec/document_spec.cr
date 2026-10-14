@@ -128,6 +128,35 @@ describe LSP::Document do
     doc.value.should eq("a\npu")
   end
 
+  it "accepts a snippet item as tabstops and selects the first placeholder" do
+    server = started(FakeServer.new(%({"textDocumentSync": 2, "completionProvider": {}})))
+    server.on("textDocument/completion") do |_params|
+      json(%({"isIncomplete": false, "items": [
+        {"label": "each", "insertTextFormat": 2, "insertText": "each do |${1:item}|\\n  $0\\nend"}
+      ]}))
+    end
+    synced_doc, doc = synced(server, "ea")
+    items = [] of LSP::Completion
+    synced_doc.complete { |found| items = found; nil }
+    eventually { items.size == 1 }
+
+    items.first.snippet?.should be_true
+    items.first.text.should eq("each do |item|\n  \nend")
+
+    snippet = synced_doc.snippet(items.first).not_nil!
+    doc.value.should eq("each do |item|\n  \nend")
+    doc.selected_text.should eq("item")
+    snippet.size.should eq(2)
+
+    doc.insert("line")
+    doc.value.should eq("each do |line|\n  \nend")
+    snippet.next_stop(doc.view).should be_true
+    doc.cursor.should eq(17)
+
+    doc.undo
+    doc.value.should eq("each do |item|\n  \nend")
+  end
+
   it "reads hover in every shape the protocol allows" do
     server = started(FakeServer.new)
     replies = [
