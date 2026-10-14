@@ -58,7 +58,12 @@ module LSP
   record Diagnostic, range : Range(Int32, Int32), severity : Severity, message : String, source : String?, code : String?
 
   record Completion, label : String, kind : Int32?, detail : String?, documentation : String?, text : String,
-    span : Span?, filter : String, sort : String, additional : Array(RemoteEdit), data : JSON::Any
+    span : Span?, filter : String, sort : String, additional : Array(RemoteEdit), data : JSON::Any,
+    snippet : String? = nil do
+    def snippet? : Bool
+      !@snippet.nil?
+    end
+  end
 
   record Signature, label : String, documentation : String?, parameters : Array(Range(Int32, Int32)), active : Int32?
 
@@ -117,7 +122,8 @@ module LSP
       filter: item["filterText"]?.try(&.as_s?) || label,
       sort: item["sortText"]?.try(&.as_s?) || label,
       additional: text_edits(item["additionalTextEdits"]?),
-      data: item)
+      data: item,
+      snippet: snippet ? raw : nil)
   end
 
   def self.signature_help(json : JSON::Any) : SignatureHelp?
