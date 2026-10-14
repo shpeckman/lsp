@@ -8,7 +8,7 @@ module LSP
   class Client
     alias Dispatch = Proc(Proc(Nil), Nil)
 
-    ENCODINGS = {"utf-8" => Scribe::Units::Bytes, "utf-16" => Scribe::Units::Utf16, "utf-32" => Scribe::Units::CodePoints}
+    ENCODINGS        = {"utf-8" => Scribe::Units::Bytes, "utf-16" => Scribe::Units::Utf16, "utf-32" => Scribe::Units::CodePoints}
     METHOD_NOT_FOUND = -32601
     NULL             = JSON::Any.new(nil)
 
@@ -56,7 +56,7 @@ module LSP
 
     def start(root : String? = nil, name : String = "lsp.cr", &ready : -> Nil) : Nil
       folders = root ? [{uri: root, name: File.basename(URI.parse(root).path)}] : nil
-      params  = {
+      params = {
         processId:        Process.pid,
         clientInfo:       {name: name},
         rootUri:          root,

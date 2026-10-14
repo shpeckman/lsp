@@ -83,7 +83,7 @@ module LSP
       found.each { |part| markup(part).try { |text| parts << text } }
       parts.empty? ? nil : parts.join("\n\n")
     when Hash
-      value = json.try(&.["value"]?).try(&.as_s?) || return nil
+      value    = json.try(&.["value"]?).try(&.as_s?) || return nil
       language = json.try(&.["language"]?).try(&.as_s?)
       language ? "```#{language}\n#{value}\n```" : value
     end

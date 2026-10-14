@@ -200,7 +200,7 @@ describe LSP::Document do
   end
 
   it "finds definitions from locations and location links" do
-    server  = started(FakeServer.new(encoding: "utf-8"))
+    server = started(FakeServer.new(encoding: "utf-8"))
     replies = [
       json(%({"uri": "file:///work/b.cr", "range": {"start": {"line": 1, "character": 2}, "end": {"line": 1, "character": 5}}})),
       json(%([{"targetUri": "file:///work/c.cr", "targetRange": {"start": {"line": 0, "character": 0}, "end": {"line": 9, "character": 0}},

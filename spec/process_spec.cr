@@ -1,19 +1,9 @@
 # spec/process_spec.cr
 require "./spec_helper"
 
-private def fixture : String
-  binary = File.join(Dir.tempdir, "lsp-spec-server-#{Process.pid}")
-  unless File.exists?(binary)
-    status = Process.run("crystal", ["build", File.join(__DIR__, "fixtures", "server.cr"), "-o", binary], output: :inherit, error: :inherit)
-    raise "fixture server did not build" unless status.success?
-    at_exit { File.delete?(binary) }
-  end
-  binary
-end
-
 describe "LSP::Client.spawn" do
   it "talks to a server process over its standard streams" do
-    client = LSP::Client.spawn(fixture)
+    client = LSP::Client.spawn(fixture_server)
     ready  = false
     client.start(LSP::Session.uri(Dir.current)) { ready = true }
     eventually(30.seconds) { ready }
