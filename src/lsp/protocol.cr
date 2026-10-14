@@ -19,9 +19,48 @@ module LSP
       formatting: {dynamicRegistration: false},
       rename:     {prepareSupport: false},
       definition: {linkSupport: false},
+      inlayHint:  {dynamicRegistration: false},
+      references: {dynamicRegistration: false},
+      documentSymbol: {hierarchicalDocumentSymbolSupport: true, dynamicRegistration: false},
+      codeAction: {
+        codeActionLiteralSupport: {codeActionKind: {valueSet: CODE_ACTION_KINDS}},
+        resolveSupport:           {properties: ["edit"]},
+        dataSupport:              true,
+        dynamicRegistration:      false,
+      },
+      foldingRange: {lineFoldingOnly: true, dynamicRegistration: false},
+      semanticTokens: {
+        requests:        {full: true},
+        tokenTypes:      SEMANTIC_TYPES,
+        tokenModifiers:  SEMANTIC_MODIFIERS,
+        formats:         ["relative"],
+        overlappingTokenSupport: false,
+        multilineTokenSupport:   false,
+      },
     },
-    workspace: {configuration: true, workspaceFolders: true, applyEdit: true},
+    workspace: {
+      configuration:    true,
+      workspaceFolders: true,
+      applyEdit:        true,
+      symbol:           {dynamicRegistration: false},
+    },
   }
+
+  CODE_ACTION_KINDS = ["quickfix", "refactor", "refactor.extract", "refactor.inline", "refactor.rewrite",
+                       "source", "source.organizeImports", "source.fixAll"]
+
+  SYMBOL_KINDS = {1 => "file", 2 => "module", 3 => "namespace", 4 => "package", 5 => "class", 6 => "method",
+                  7 => "property", 8 => "field", 9 => "constructor", 10 => "enum", 11 => "interface",
+                  12 => "function", 13 => "variable", 14 => "constant", 15 => "string", 16 => "number",
+                  17 => "boolean", 18 => "array", 19 => "object", 20 => "key", 21 => "null",
+                  22 => "enum_member", 23 => "struct", 24 => "event", 25 => "operator",
+                  26 => "type_parameter"}
+
+  SEMANTIC_TYPES = %w(namespace type class enum interface struct typeParameter parameter variable property
+    enumMember event function method macro keyword modifier comment string number regexp operator decorator)
+
+  SEMANTIC_MODIFIERS = %w(declaration definition readonly static deprecated abstract async modification
+    documentation defaultLibrary)
 
   enum Severity
     Error       = 1
@@ -56,6 +95,29 @@ module LSP
   record Location, uri : String, span : Span, units : Scribe::Units
 
   record Diagnostic, range : Range(Int32, Int32), severity : Severity, message : String, source : String?, code : String?
+
+  record InlayHint, point : Scribe::Point, label : String, kind : String, tooltip : String?
+
+  record Symbol, name : String, kind : String, detail : String?, uri : String, span : Span,
+    selection : Span, units : Scribe::Units, container : String?, children : Array(Symbol) do
+    def each(&block : Symbol, Int32 -> Nil) : Nil
+      walk(0) { |found, depth| block.call(found, depth) }
+    end
+
+    protected def walk(depth : Int32, &block : Symbol, Int32 -> Nil) : Nil
+      block.call(self, depth)
+      @children.each { |child| child.walk(depth + 1, &block) }
+    end
+  end
+
+  record CodeAction, title : String, kind : String?, edits : Hash(String, Array(RemoteEdit)),
+    command : String?, arguments : JSON::Any?, data : JSON::Any, preferred : Bool, disabled : String? do
+    def edits? : Bool
+      !@edits.empty?
+    end
+  end
+
+  record FoldRange, first : Int32, last : Int32, kind : String?
 
   record Completion, label : String, kind : Int32?, detail : String?, documentation : String?, text : String,
     span : Span?, filter : String, sort : String, additional : Array(RemoteEdit), data : JSON::Any,
@@ -97,6 +159,86 @@ module LSP
   def self.text_edits(json : JSON::Any?) : Array(RemoteEdit)
     (json.try(&.as_a?) || [] of JSON::Any).map do |edit|
       RemoteEdit.new(Span.parse(edit["range"]), edit["newText"].as_s)
+    end
+  end
+
+  def self.symbols(json : JSON::Any?, uri : String, units : Scribe::Units) : Array(Symbol)
+    (json.try(&.as_a?) || [] of JSON::Any).compact_map { |entry| symbol(entry, uri, units) }
+  end
+
+  def self.symbol(entry : JSON::Any, uri : String, units : Scribe::Units, container : String? = nil) : Symbol?
+    name = entry["name"]?.try(&.as_s?) || return nil
+    kind = SYMBOL_KINDS[entry["kind"]?.try(&.as_i?)]? || "other"
+    here = entry["location"]?.try(&.["uri"]?).try(&.as_s?) || uri
+
+    span = if range = entry["range"]?
+             Span.parse(range)
+           elsif place = entry["location"]?.try(&.["range"]?)
+             Span.parse(place)
+           else
+             return nil
+           end
+    pick = entry["selectionRange"]?.try { |found| Span.parse(found) } || span
+
+    kids = [] of Symbol
+    (entry["children"]?.try(&.as_a?) || [] of JSON::Any).each do |child|
+      symbol(child, here, units, name).try { |found| kids << found }
+    end
+
+    Symbol.new(name, kind, entry["detail"]?.try(&.as_s?), here, span, pick, units,
+      entry["containerName"]?.try(&.as_s?) || container, kids)
+  end
+
+  def self.code_actions(json : JSON::Any?) : Array(CodeAction)
+    (json.try(&.as_a?) || [] of JSON::Any).compact_map do |entry|
+      next nil if entry["title"]?.nil?
+
+      command = entry["command"]?
+      name    = command.try(&.as_s?) || command.try(&.["command"]?).try(&.as_s?)
+      args    = command.try(&.["arguments"]?)
+
+      CodeAction.new(
+        title: entry["title"].as_s,
+        kind: entry["kind"]?.try(&.as_s?),
+        edits: entry["edit"]?.try { |found| workspace_edit(found) } || {} of String => Array(RemoteEdit),
+        command: name,
+        arguments: args,
+        data: entry,
+        preferred: entry["isPreferred"]?.try(&.as_bool?) || false,
+        disabled: entry["disabled"]?.try(&.["reason"]?).try(&.as_s?))
+    end
+  end
+
+  HINT_KINDS = {1 => "type", 2 => "parameter"}
+
+  def self.inlay_hints(json : JSON::Any?) : Array(InlayHint)
+    (json.try(&.as_a?) || [] of JSON::Any).compact_map do |entry|
+      position = entry["position"]? || next nil
+      label    = inlay_label(entry["label"]?) || next nil
+      pad      = entry["paddingLeft"]?.try(&.as_bool?) ? " " : ""
+      tail     = entry["paddingRight"]?.try(&.as_bool?) ? " " : ""
+
+      InlayHint.new(point(position), "#{pad}#{label}#{tail}",
+        HINT_KINDS[entry["kind"]?.try(&.as_i?)]? || "hint", markup(entry["tooltip"]?))
+    end
+  end
+
+  def self.inlay_label(json : JSON::Any?) : String?
+    return nil if json.nil?
+    return json.as_s? if json.as_s?
+
+    parts = json.as_a? || return nil
+    text  = parts.compact_map { |part| part["value"]?.try(&.as_s?) }.join
+    text.empty? ? nil : text
+  end
+
+  def self.fold_ranges(json : JSON::Any?) : Array(FoldRange)
+    (json.try(&.as_a?) || [] of JSON::Any).compact_map do |entry|
+      first = entry["startLine"]?.try(&.as_i?) || next nil
+      last  = entry["endLine"]?.try(&.as_i?) || next nil
+      next nil if last <= first
+
+      FoldRange.new(first, last, entry["kind"]?.try(&.as_s?))
     end
   end
 

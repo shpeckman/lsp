@@ -7,6 +7,7 @@ require "./lsp/client"
 require "./lsp/server"
 require "./lsp/protocol"
 require "./lsp/snippet"
+require "./lsp/semantic"
 require "./lsp/session"
 require "./lsp/document"
 
