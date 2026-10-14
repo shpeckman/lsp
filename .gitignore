@@ -5,3 +5,4 @@
 /.shards/
 shard.lock
 *.dwarf
+/vendor/servers/

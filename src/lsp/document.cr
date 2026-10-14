@@ -105,7 +105,7 @@ module LSP
 
     def saved : Nil
       include_text = client.capability("textDocumentSync", "save", "includeText").try(&.as_bool?) == true
-      params = include_text ? {textDocument: {uri: @uri}, text: @document.value} : {textDocument: {uri: @uri}, text: nil}
+      params       = include_text ? {textDocument: {uri: @uri}, text: @document.value} : {textDocument: {uri: @uri}, text: nil}
       client.notify("textDocument/didSave", params)
     end
 

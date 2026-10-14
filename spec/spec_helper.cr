@@ -1,5 +1,6 @@
 # spec/spec_helper.cr
 require "spec"
+require "file_utils"
 require "../src/lsp"
 
 struct Plain
@@ -27,12 +28,12 @@ end
 GRAPHEMES = Plain.new
 
 class FakeServer
-  getter received        = [] of JSON::Any
-  getter client          : LSP::Client
-  getter mirror          = ""
-  getter replies         = [] of JSON::Any
-  property encoding      = "utf-16"
-  property capabilities  : JSON::Any
+  getter received = [] of JSON::Any
+  getter client : LSP::Client
+  getter mirror  = ""
+  getter replies = [] of JSON::Any
+  property encoding = "utf-16"
+  property capabilities : JSON::Any
 
   @transport : LSP::Transport
   @handlers  : Hash(String, Proc(JSON::Any, JSON::Any))
@@ -103,8 +104,8 @@ class FakeServer
     when "textDocument/didChange"
       params["contentChanges"].as_a.each do |change|
         if range = change["range"]?
-          start  = index(range["start"])
-          stop   = index(range["end"])
+          start   = index(range["start"])
+          stop    = index(range["end"])
           @mirror = @mirror.byte_slice(0, start) + change["text"].as_s + @mirror.byte_slice(stop, @mirror.bytesize - stop)
         else
           @mirror = change["text"].as_s
@@ -123,7 +124,7 @@ class FakeServer
       break if units >= point["character"].as_i
 
       units += @encoding == "utf-8" ? char.bytesize : (@encoding == "utf-32" ? 1 : (char.ord > 0xFFFF ? 2 : 1))
-      byte  += char.bytesize
+      byte += char.bytesize
     end
     byte
   end
@@ -146,4 +147,22 @@ end
 
 def text(value : String = "", **options) : Scribe::Document
   Scribe::Document.new(GRAPHEMES, value, **options, filter: Scribe::MultiLine.new)
+end
+
+def fixture_server : String
+  binary = File.join(Dir.tempdir, "lsp-spec-server-#{Process.pid}")
+  unless File.exists?(binary)
+    status = Process.run("crystal", ["build", File.join(__DIR__, "fixtures", "server.cr"), "-o", binary], output: :inherit, error: :inherit)
+    raise "fixture server did not build" unless status.success?
+    at_exit { File.delete?(binary) }
+  end
+  binary
+end
+
+def with_search_path(path : Array(String), &) : Nil
+  saved = LSP.search_path
+  LSP.search_path = path
+  yield
+ensure
+  LSP.search_path = saved.not_nil!
 end

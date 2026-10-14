@@ -9,7 +9,7 @@ It depends only on scribe and the standard library.
 ## Requirements
 
 - Crystal 1.21 or newer
-- A language server for each language you want to support, started as a process that speaks JSON-RPC on its standard streams
+- A language server for each language you want to support, started as a process that speaks JSON-RPC on its standard streams (see Servers)
 
 ## Installation
 
@@ -28,7 +28,8 @@ Then run `shards install` and `require "lsp"`.
 ```crystal
 require "lsp"
 
-client  = LSP::Client.spawn("crystalline")
+server  = LSP.server("crystal") || abort LSP.missing("crystal")
+client  = server.spawn
 session = LSP::Session.new(client)
 
 client.start(LSP::Session.uri(Dir.current)) do
@@ -36,7 +37,7 @@ client.start(LSP::Session.uri(Dir.current)) do
 end
 
 document = Scribe::Document.new(graphemes, File.read("src/app.cr"), filter: Scribe::MultiLine.new)
-synced   = session.open(document, LSP::Session.uri("src/app.cr"), "crystal")
+synced   = session.open(document, LSP::Session.uri("src/app.cr"), server.language_id)
 
 document.insert("x")                       # sent to the server as an incremental change
 document.decorations                       # the server's diagnostics, moving with your edits
@@ -44,21 +45,57 @@ synced.hover { |text| puts text }          # markdown or plain text, or nil
 synced.complete { |items| synced.accept(items.first) unless items.empty? }
 ```
 
+## Servers
+
+lsp knows a server, or a list in order of preference, for each language `treesitter` bundles, under the same names:
+
+| Language  | Servers, preferred first              | Language id   |
+|-----------|---------------------------------------|---------------|
+| `bash`    | `bash-language-server start`          | `shellscript` |
+| `c`       | `clangd`                              | `c`           |
+| `crystal` | `crystalline`                         | `crystal`     |
+| `json`    | `vscode-json-language-server --stdio` | `json`        |
+| `python`  | `pyright-langserver --stdio`, `pylsp` | `python`      |
+
+```crystal
+LSP.server("python")              # the first one installed, or nil
+LSP.servers("python")             # every known one, installed or not
+LSP.missing("python")             # what to install, for a message to the user
+LSP::Client.spawn_for("python")   # spawn the first one installed, or nil
+server.path                       # where it was found
+```
+
+A server is looked for in `LSP.search_path` first — by default this shard's `vendor/servers/bin` and `vendor/servers/node_modules/.bin`, filled by `make servers` — and then on `PATH`. `LSP.search_path=` replaces the list. `LSP.register(language, LSP::Server.new(name, command, args, language_id:, hint:))` adds a server, ahead of the known ones unless `first: false`, and replaces one with the same name.
+
+### Installing servers
+
+The shard installs nothing by itself. `make servers`, run in this repository (or `make -C lib/lsp servers` from an application), installs what it can into `vendor/servers/` and reports the rest:
+
+| Target                      | Does                                                                                                                                                        |
+|-----------------------------|-------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `make crystalline`          | Clones crystalline, checks out `CRYSTALLINE_REF` (default `master`) and builds it with your `crystal` into `vendor/servers/bin`; this takes several minutes |
+| `make node-servers`         | `npm install`s pyright, bash-language-server and vscode-langservers-extracted into `vendor/servers` (override with `NODE_SERVERS`)                          |
+| `make clangd`, `make pylsp` | Only check for the system packages and print how to install them                                                                                            |
+| `make status`               | Shows where each server would be found, or that it is missing                                                                                               |
+| `make clean-servers`        | Removes `vendor/servers`                                                                                                                                    |
+
+On Fedora, building crystalline needs the LLVM development files (`sudo dnf install llvm-devel`), and the node servers need `nodejs` and `npm`. clangd comes from `clang-tools-extra`, pylsp from `python3-lsp-server`. crystalline has to be built for the Crystal version you use, which is why it is built rather than downloaded; pin a commit with `make crystalline CRYSTALLINE_REF=<commit>`. Extra compiler flags go in `CRYSTAL_FLAGS`; for example, when linking fails with undefined `LLVM…` symbols because `llvm-config` cannot list the LLVM libraries, `CRYSTAL_FLAGS='--link-flags /path/to/libLLVM.so.<version>'` links the shared library directly.
+
 ## The client
 
 `LSP::Client.spawn(command, args, chdir:, env:, dispatch:)` starts the server with its standard input and output piped, and its standard error discarded. `LSP::Client.new(transport, dispatch:)` works over any pair of IOs, for a server reached some other way.
 
-| Method | Effect |
-| --- | --- |
-| `start(root_uri) { }` | Sends `initialize`, negotiates capabilities and position encoding, sends `initialized`, then runs the block |
-| `request(method, params, on_error) { \|result\| }` | Sends a request and returns its id; the block gets the result as `JSON::Any` |
-| `notify(method, params)` | Sends a notification |
-| `cancel(id)` | Drops a pending request and tells the server |
-| `on(method) { \|params\| }` | Listens for a server notification; returns a proc that stops listening |
-| `on_request(method) { \|params\| reply }` | Answers a server request; `workspace/configuration`, capability registration and progress creation are answered by default |
-| `capability(*path)` | Reads the server's capabilities, for example `capability("hoverProvider")` |
-| `shutdown { }`, `close`, `on_close { }` | Ends the session politely, kills it, or learns when the server went away |
-| `encoding` | The negotiated `Scribe::Units`: `Bytes` for UTF-8, `Utf16` (the protocol default) or `CodePoints` for UTF-32 |
+| Method                                             | Effect                                                                                                                     |
+|----------------------------------------------------|----------------------------------------------------------------------------------------------------------------------------|
+| `start(root_uri) { }`                              | Sends `initialize`, negotiates capabilities and position encoding, sends `initialized`, then runs the block                |
+| `request(method, params, on_error) { \|result\| }` | Sends a request and returns its id; the block gets the result as `JSON::Any`                                               |
+| `notify(method, params)`                           | Sends a notification                                                                                                       |
+| `cancel(id)`                                       | Drops a pending request and tells the server                                                                               |
+| `on(method) { \|params\| }`                        | Listens for a server notification; returns a proc that stops listening                                                     |
+| `on_request(method) { \|params\| reply }`          | Answers a server request; `workspace/configuration`, capability registration and progress creation are answered by default |
+| `capability(*path)`                                | Reads the server's capabilities, for example `capability("hoverProvider")`                                                 |
+| `shutdown { }`, `close`, `on_close { }`            | Ends the session politely, kills it, or learns when the server went away                                                   |
+| `encoding`                                         | The negotiated `Scribe::Units`: `Bytes` for UTF-8, `Utf16` (the protocol default) or `CodePoints` for UTF-32               |
 
 Anything sent before the server has answered `initialize` is queued and sent, in order, once it has.
 
@@ -82,15 +119,15 @@ client = LSP::Client.spawn("crystalline", dispatch: ->(work : Proc(Nil)) { app.e
 
 Every request returns its id, for `client.cancel`, and calls its block when the server answers.
 
-| Method | Block receives | Notes |
-| --- | --- | --- |
+| Method                    | Block receives                   | Notes                                                                                                                    |
+|---------------------------|----------------------------------|--------------------------------------------------------------------------------------------------------------------------|
 | `complete(trigger = nil)` | `Array(LSP::Completion)`, sorted | Each item has `label`, `kind`, `detail`, `documentation` and the `text` to insert, with snippets flattened to plain text |
-| `accept(item)` | — | Applies an item: its own range or the word before the caret, plus any extra edits, as one undo step |
-| `hover` | `String?` | Markdown or plain text |
-| `signature_help` | `LSP::SignatureHelp?` | `current` is the active signature; `parameters` are character ranges in its `label` |
-| `format` | `Bool` | Applies the server's edits as one undo step, using the document's indent for the tab size |
-| `rename(name)` | `LSP::Rename` | Applies the edits for this document; `remote` holds the edits for other files, by URI |
-| `definition` | `Array(LSP::Location)` | URIs with `span`s in the server's units, for the host to open |
+| `accept(item)`            | —                                | Applies an item: its own range or the word before the caret, plus any extra edits, as one undo step                      |
+| `hover`                   | `String?`                        | Markdown or plain text                                                                                                   |
+| `signature_help`          | `LSP::SignatureHelp?`            | `current` is the active signature; `parameters` are character ranges in its `label`                                      |
+| `format`                  | `Bool`                           | Applies the server's edits as one undo step, using the document's indent for the tab size                                |
+| `rename(name)`            | `LSP::Rename`                    | Applies the edits for this document; `remote` holds the edits for other files, by URI                                    |
+| `definition`              | `Array(LSP::Location)`           | URIs with `span`s in the server's units, for the host to open                                                            |
 
 `completion_triggers` and `signature_triggers` list the characters after which the server would like to be asked again. `apply(edits)` applies any `RemoteEdit`s for this document, and `offset(point)` and `offsets(span)` convert the server's positions to cluster offsets.
 
@@ -99,11 +136,12 @@ Every request returns its id, for `client.cancel`, and calls its block when the 
 `tui`'s `Editor` exposes the pieces a language client needs: `document`, `suggest(labels) { |index| }` for a completion popup at the caret, `note(markdown)` for hover and signature text, `on_assist` for its language keys (completion, hover, signature, format, rename, definition), and `on_edit` for typed trigger characters. Diagnostics show as soon as they arrive, because they are decorations on the document.
 
 ```crystal
-def connect(ctx : TUI::Context, editor : TUI::Editor, path : String, command : String) : LSP::Document
-  client  = LSP::Client.spawn(command, dispatch: ->(work : Proc(Nil)) { ctx.app.enqueue(work); nil })
+def connect(ctx : TUI::Context, editor : TUI::Editor, path : String, language : String) : LSP::Document?
+  server  = LSP.server(language) || return nil
+  client  = server.spawn(dispatch: ->(work : Proc(Nil)) { ctx.app.enqueue(work); nil })
   session = LSP::Session.new(client)
   client.start(LSP::Session.uri(Dir.current)) { }
-  synced = session.open(editor.document, LSP::Session.uri(path), "crystal")
+  synced = session.open(editor.document, LSP::Session.uri(path), server.language_id)
 
   complete = ->(trigger : String?) do
     synced.complete(trigger) { |items| editor.suggest(items.map(&.label)) { |index| synced.accept(items[index]); nil } }
@@ -135,7 +173,7 @@ def connect(ctx : TUI::Context, editor : TUI::Editor, path : String, command : S
 end
 ```
 
-`ask_for_name` and `open_location` are the application's: a prompt for the new name, and opening another file.
+`ask_for_name` and `open_location` are the application's: a prompt for the new name, and opening another file. With `treesitter`, `TreeSitter.language_for(path).try(&.name)` gives the `language` to pass.
 
 ## Development
 
@@ -143,7 +181,7 @@ end
 crystal spec
 ```
 
-The specs talk to a scripted server running in the same process over pipes, which checks every incremental change by applying it to its own copy of the text in the negotiated encoding. One spec builds `spec/fixtures/server.cr` and runs it as a real child process.
+The specs talk to a scripted server running in the same process over pipes, which checks every incremental change by applying it to its own copy of the text in the negotiated encoding. Two specs build `spec/fixtures/server.cr` and run it as a real child process. `spec/real_server_spec.cr` runs diagnostics, hover, definition and completion against crystalline when it is installed (after `make crystalline`), and is pending otherwise.
 
 ## License
 
